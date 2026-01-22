@@ -100,6 +100,30 @@ def parse_args():
     parser.add_argument('--topk', type=int, default=128, help='Top-k for sparse Gumbel-Softmax')
     parser.add_argument('--mask_ratio', type=float, default=0.25, help='Ratio of tokens to mask')
     parser.add_argument('--max_caption_len', type=int, default=64, help='Fixed caption length')
+    parser.add_argument(
+        '--enable_dam_dual_loop',
+        action='store_true',
+        help='If set, interleave a DAM-only cycle-consistency loop with the existing training loop and apply '
+             'gradient surgery (Loop2 grad projected orthogonal to Loop1 grad) before each optimizer step.')
+    parser.add_argument(
+        '--dam_data_root',
+        type=str,
+        default=None,
+        help='Root of extracted Describe Anything Dataset (contains SAV/COCOStuff/LVIS/Mapillary/OpenImages/PACO subdirs). '
+             'Default resolves to `data/describe-anything-dataset/describe-anything-dataset` under repo root if present.')
+    parser.add_argument(
+        '--dam_splits',
+        type=str,
+        default='SAV,COCOStuff,LVIS,Mapillary,OpenImages,PACO',
+        help='Comma-separated DAM splits to include when `--enable_dam_dual_loop` is set.')
+    parser.add_argument('--dam_max_samples', type=int, default=None, help='Optional cap on DAM samples (debug).')
+    parser.add_argument('--dam_beta', type=float, default=0.5, help='Beta weight for Loop2 loss (after grad surgery).')
+    parser.add_argument(
+        '--dam_caption_len',
+        type=int,
+        default=None,
+        help='Fixed token length used for DAM captions (default: use --max_caption_len).')
+    parser.add_argument('--dam_num_workers', type=int, default=2, help='DAM dataloader workers.')
 
     # LoRA params (same as sa2va_4b.py)
     parser.add_argument('--lora_r', type=int, default=128)
@@ -380,6 +404,34 @@ def build_datasets(args):
     return pseudo_dataset, refcoco_dataset
 
 
+def build_dam_dataset(args):
+    if not getattr(args, "enable_dam_dual_loop", False):
+        return None
+    from projects.llava_sam2.datasets.describe_anything_referring_dataset import DescribeAnythingLocalRegionDataset
+    splits = [s.strip() for s in str(args.dam_splits).split(",") if s.strip()]
+    return DescribeAnythingLocalRegionDataset(
+        data_root=args.dam_data_root,
+        splits=splits,
+        max_samples=args.dam_max_samples,
+        cache_dir=os.path.join(args.output_dir, "dam_cache"),
+    )
+
+
+def collate_fn_dam(batch):
+    pixel_values = torch.stack([b["pixel_values"] for b in batch], dim=0)
+    g_pixel_values = torch.stack([b["g_pixel_values"] for b in batch], dim=0)
+    prompt_masks = torch.stack([b["prompt_masks"] for b in batch], dim=0)
+    masks_1024 = torch.stack([b["masks_1024"] for b in batch], dim=0)
+    captions = [b["caption"] for b in batch]
+    return {
+        "pixel_values": pixel_values,
+        "g_pixel_values": g_pixel_values,
+        "prompt_masks": prompt_masks,
+        "masks_1024": masks_1024,
+        "captions": captions,
+    }
+
+
 class PseudoGumbelTrainerV2:
     """
     Corrected Pseudo Token + Gumbel-Softmax Trainer.
@@ -387,13 +439,25 @@ class PseudoGumbelTrainerV2:
     Follows Sa2VA's standard data format and model interfaces.
     """
 
-    def __init__(self, model, ema_model, tokenizer, train_dataloader_pseudo, train_dataloader_refcoco,
-                 optimizer, device, output_dir, args):
+    def __init__(
+        self,
+        model,
+        ema_model,
+        tokenizer,
+        train_dataloader_pseudo,
+        train_dataloader_refcoco,
+        train_dataloader_dam,
+        optimizer,
+        device,
+        output_dir,
+        args,
+    ):
         self.model = model
         self.ema_model = ema_model
         self.tokenizer = tokenizer
         self.train_dataloader_pseudo = train_dataloader_pseudo
         self.train_dataloader_refcoco = train_dataloader_refcoco
+        self.train_dataloader_dam = train_dataloader_dam
         self.optimizer = optimizer
         self.device = device
         self.output_dir = Path(output_dir)
@@ -405,6 +469,9 @@ class PseudoGumbelTrainerV2:
         self.topk = args.topk
         self.mask_ratio = args.mask_ratio
         self.max_caption_len = args.max_caption_len
+        self.enable_dam_dual_loop = bool(getattr(args, "enable_dam_dual_loop", False))
+        self.dam_beta = float(getattr(args, "dam_beta", 0.5))
+        self.dam_caption_len = int(getattr(args, "dam_caption_len", None) or self.max_caption_len)
         self.ref_llm_loss_weight = float(getattr(args, 'ref_llm_loss_weight', 1.0))
         self.pseudo_llm_loss_weight = float(getattr(args, 'pseudo_llm_loss_weight', 1.0))
         self.masked_lm_loss_weight = float(getattr(args, 'masked_lm_loss_weight', 0.0))
@@ -430,6 +497,11 @@ class PseudoGumbelTrainerV2:
         self.prompt_template = PROMPT_TEMPLATE.phi3_chat
         self.reached_max_steps = False
         self._last_teacher_token_stat_step = None
+        self._dam_iter = iter(self.train_dataloader_dam) if self.train_dataloader_dam is not None else None
+
+        # Params to apply gradient surgery on (trainables only).
+        self._trainable_params = [p for p in self.actual_model.parameters() if p.requires_grad]
+        self._accum_grads = None  # lazily initialized list aligned to _trainable_params
 
     def _log_teacher_token_stats(self, pseudo_toks: torch.Tensor):
         """
@@ -553,7 +625,7 @@ class PseudoGumbelTrainerV2:
         self.ema_model.eval()
 
         # Ensure DistributedSampler shuffles deterministically per-epoch.
-        for dl in (self.train_dataloader_pseudo, self.train_dataloader_refcoco):
+        for dl in (self.train_dataloader_pseudo, self.train_dataloader_refcoco, self.train_dataloader_dam):
             if dl is None:
                 continue
             sampler = getattr(dl, "sampler", None)
@@ -679,19 +751,37 @@ class PseudoGumbelTrainerV2:
             loss = loss_dict['loss']
 
             try:
-                # Backward
-                loss_scaled = loss / self.args.gradient_accumulation_steps
-                loss_scaled.backward()
+                dam_loss_dict = None
+                if self.enable_dam_dual_loop:
+                    dam_batch = self._next_dam_batch()
+                    dam_pixel_values = dam_batch["pixel_values"].to(self.device, dtype=torch.bfloat16)
+                    dam_g_pixel_values = dam_batch["g_pixel_values"].to(self.device)
+                    dam_captions = dam_batch["captions"]
+                    dam_loss_dict = self.dam_cycle_step(dam_pixel_values, dam_g_pixel_values, dam_captions)
+
+                    self._dual_loop_backward_accumulate(
+                        loss1=loss,
+                        loss2=dam_loss_dict["loss"],
+                        beta=self.dam_beta,
+                        grad_accum_steps=self.args.gradient_accumulation_steps,
+                    )
+                else:
+                    # Backward (single-loop baseline)
+                    loss_scaled = loss / self.args.gradient_accumulation_steps
+                    loss_scaled.backward()
 
                 # Sanity checks (每log_interval步检查一次)
-                if self.global_step % self.args.log_interval == 0:
+                if (not self.enable_dam_dual_loop) and (self.global_step % self.args.log_interval == 0):
                     self.check_gradients()
 
                 # Update weights
                 if (step + 1) % self.args.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    if self.enable_dam_dual_loop:
+                        self._maybe_step_with_accum_grads()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
 
                     # Update EMA
                     student = self.model.module if hasattr(self.model, 'module') else self.model
@@ -718,6 +808,8 @@ class PseudoGumbelTrainerV2:
                 self.writer.add_scalar('train/dice_loss', loss_dict.get('dice_loss', 0), self.global_step)
                 if 'llm_loss' in loss_dict:
                     self.writer.add_scalar('train/llm_loss', loss_dict.get('llm_loss', 0), self.global_step)
+                if self.enable_dam_dual_loop and dam_loss_dict is not None:
+                    self.writer.add_scalar('train/dam_caption_ce', dam_loss_dict.get('dam_caption_ce', 0), self.global_step)
 
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
@@ -959,6 +1051,168 @@ class PseudoGumbelTrainerV2:
                 'llm_loss': 0.0,
             }
 
+    def _next_dam_batch(self):
+        if self.train_dataloader_dam is None:
+            raise RuntimeError("DAM dataloader is None but enable_dam_dual_loop is set")
+        if self._dam_iter is None:
+            self._dam_iter = iter(self.train_dataloader_dam)
+        try:
+            return next(self._dam_iter)
+        except StopIteration:
+            self._dam_iter = iter(self.train_dataloader_dam)
+            return next(self._dam_iter)
+
+    def dam_cycle_step(self, pixel_values, g_pixel_values, captions):
+        """
+        Loop2 (DAM-only):
+          A) image + caption -> mask'
+          B) image + mask'  -> caption'
+          Loss2: CE(caption', caption) under DAM captioning prompt.
+        """
+        from projects.llava_sam2.mask_caption_sft.pseudo_gumbel_core import (
+            predict_masks_with_text_embeds,
+            compute_dam_caption_ce_loss,
+        )
+
+        batch_size = pixel_values.shape[0]
+        cap_len = int(self.dam_caption_len)
+        pad_id = int(self.pad_token_id)
+
+        # Caption -> fixed-length token ids -> embeddings
+        cap_ids = []
+        for c in captions:
+            ids = self.tokenizer.encode(str(c), add_special_tokens=False)
+            ids = ids[:cap_len]
+            if len(ids) < cap_len:
+                ids = ids + [pad_id] * (cap_len - len(ids))
+            cap_ids.append(ids)
+        cap_ids = torch.tensor(cap_ids, device=self.device, dtype=torch.long)
+        cap_embeds = self.embedding_layer(cap_ids)  # (B,T,D)
+
+        # Step A: predict mask' (no supervision here; only used to condition Step B)
+        pred_masks = predict_masks_with_text_embeds(
+            model=self.actual_model,
+            pixel_values=pixel_values,
+            g_pixel_values=g_pixel_values,
+            text_embeds=cap_embeds,
+            seg_token_id=self.seg_token_id,
+            tokenizer=self.tokenizer,
+            device=self.device,
+        )
+
+        # Convert mask' -> prompt_masks grid for Step B conditioning.
+        # NOTE: thresholding is non-differentiable; the Loop2 gradient mainly trains Step B (captioning path).
+        with torch.no_grad():
+            m = pred_masks
+            if m.dim() == 4:
+                m = m[:, 0:1]  # (B,1,H,W)
+            m = torch.sigmoid(m).float()
+            pooled = F.adaptive_avg_pool2d(m, (16, 16))  # (B,1,16,16)
+            prompt_masks_pred = (pooled > 0.5).to(torch.uint8).squeeze(1)  # (B,16,16)
+
+        # Step B: mask' + image -> caption' (teacher forcing CE against caption)
+        cap_loss = compute_dam_caption_ce_loss(
+            model=self.actual_model,
+            pixel_values=pixel_values,
+            prompt_masks=prompt_masks_pred,
+            captions=captions,
+            tokenizer=self.tokenizer,
+            max_caption_len=cap_len,
+            device=self.device,
+        )
+        return {"loss": cap_loss, "dam_caption_ce": float(cap_loss.item()), "batch_size": batch_size}
+
+    def _dual_loop_backward_accumulate(self, loss1, loss2, *, beta: float, grad_accum_steps: int):
+        """
+        Accumulate combined grads with gradient surgery:
+          g = g1 + beta * (g2 - proj_{g1}(g2))
+        """
+        if self._accum_grads is None:
+            self._accum_grads = [None] * len(self._trainable_params)
+
+        # 1) g1 (DDP will all-reduce grads here)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss1.backward()
+        g1_list = []
+        for p in self._trainable_params:
+            if p.grad is None:
+                g1_list.append(None)
+            else:
+                g1_list.append(p.grad.detach().clone())
+
+        # 2) g2 (DDP will all-reduce grads here)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss2.backward()
+
+        # 3) project g2 orthogonal to g1 and accumulate (GLOBAL projection over the concatenated grad vector)
+        dot = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g1_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g2_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        for i, p in enumerate(self._trainable_params):
+            g1 = g1_list[i]
+            g2 = p.grad
+            if g1 is None or g2 is None:
+                continue
+            g1_f = g1.float()
+            g2_f = g2.detach().float()
+            dot = dot + (g1_f * g2_f).sum()
+            g1_norm2 = g1_norm2 + (g1_f * g1_f).sum()
+            g2_norm2 = g2_norm2 + (g2_f * g2_f).sum()
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(dot, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g1_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g2_norm2, op=dist.ReduceOp.SUM)
+
+        if float(g1_norm2.item()) > 0:
+            coeff = dot / g1_norm2
+        else:
+            coeff = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+
+        if self.global_step % self.args.log_interval == 0:
+            if (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0:
+                denom = (g1_norm2.sqrt() * g2_norm2.sqrt()).clamp_min(1e-12)
+                cos = (dot / denom).item()
+                self.writer.add_scalar('grad_surgery/dot_g1_g2', float(dot.item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/g1_norm', float(g1_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/g2_norm', float(g2_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/cos_g1_g2', float(cos), self.global_step)
+                self.writer.add_scalar('grad_surgery/coeff', float(coeff.item()), self.global_step)
+
+        for i, p in enumerate(self._trainable_params):
+            g1 = g1_list[i]
+            g2 = p.grad.detach() if p.grad is not None else None
+            if g1 is None and g2 is None:
+                continue
+            if g1 is None:
+                g = beta * g2
+            else:
+                if g2 is None:
+                    g2_orth = None
+                else:
+                    g2_orth = g2 - coeff.to(dtype=g2.dtype) * g1
+                g = g1 if g2_orth is None else (g1 + beta * g2_orth)
+
+            g = g / float(grad_accum_steps)
+            if self._accum_grads[i] is None:
+                self._accum_grads[i] = g.detach().clone()
+            else:
+                self._accum_grads[i].add_(g.detach())
+
+        # Clear parameter grads (we keep accumulation buffers in self._accum_grads).
+        self.optimizer.zero_grad(set_to_none=True)
+
+    def _maybe_step_with_accum_grads(self):
+        if self._accum_grads is None:
+            return
+        # Assign accumulated grads into .grad fields for optimizer.step().
+        for i, p in enumerate(self._trainable_params):
+            p.grad = self._accum_grads[i]
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        self._accum_grads = [None] * len(self._trainable_params)
+
     def check_gradients(self):
         """Sanity check: verify gradients flow correctly."""
         # Check 1: text_embeds gradient
@@ -1175,8 +1429,14 @@ def main():
     # DDP
     if args.local_rank != -1:
         from torch.nn.parallel import DistributedDataParallel as DDP
-        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank,
-                    broadcast_buffers=False, static_graph=False)
+        model = DDP(
+            model,
+            device_ids=[args.local_rank],
+            output_device=args.local_rank,
+            broadcast_buffers=False,
+            static_graph=False,
+            find_unused_parameters=bool(getattr(args, "enable_dam_dual_loop", False)),
+        )
         print(f"✓ DDP on rank {args.local_rank}")
 
     # EMA
@@ -1187,16 +1447,19 @@ def main():
 
     # Dataset
     pseudo_dataset, refcoco_dataset = build_datasets(args)
+    dam_dataset = build_dam_dataset(args)
 
     from projects.llava_sam2.mask_caption_sft.dataset_builder import collate_fn_mask_caption
 
     if args.local_rank != -1:
         pseudo_sampler = DistributedSampler(pseudo_dataset, shuffle=True)
         ref_sampler = DistributedSampler(refcoco_dataset, shuffle=True) if refcoco_dataset is not None else None
+        dam_sampler = DistributedSampler(dam_dataset, shuffle=True) if dam_dataset is not None else None
         shuffle = False
     else:
         pseudo_sampler = None
         ref_sampler = None
+        dam_sampler = None
         shuffle = True
 
     # Reduce /dev/shm pressure from DataLoader tensor sharing inside Docker cgroup.
@@ -1235,6 +1498,22 @@ def main():
         )
         print(f"✓ RefCOCO dataloader: {len(ref_loader)} batches")
 
+    dam_loader = None
+    if dam_dataset is not None:
+        dam_loader = DataLoader(
+            dam_dataset,
+            batch_size=args.batch_size,
+            sampler=dam_sampler,
+            shuffle=False if dam_sampler is not None else shuffle,
+            num_workers=args.dam_num_workers,
+            collate_fn=collate_fn_dam,
+            pin_memory=False,
+            prefetch_factor=1 if args.dam_num_workers and args.dam_num_workers > 0 else None,
+            persistent_workers=bool(args.dam_num_workers and args.dam_num_workers > 0),
+            drop_last=True,
+        )
+        print(f"✓ DAM dataloader: {len(dam_loader)} batches")
+
     # Optimizer (only trainable parameters)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -1251,6 +1530,7 @@ def main():
         tokenizer=tokenizer,
         train_dataloader_pseudo=pseudo_loader,
         train_dataloader_refcoco=ref_loader,
+        train_dataloader_dam=dam_loader,
         optimizer=optimizer,
         device=device,
         output_dir=args.output_dir,

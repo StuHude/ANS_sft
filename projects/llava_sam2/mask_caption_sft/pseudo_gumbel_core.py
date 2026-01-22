@@ -841,3 +841,300 @@ def forward_mask_with_text_embeds(
         'llm_loss_t': llm_loss if torch.is_tensor(llm_loss) else torch.tensor(float(llm_loss), device=device),
         'llm_loss': llm_loss.item() if torch.is_tensor(llm_loss) else float(llm_loss),
     }
+
+
+def predict_masks_with_text_embeds(
+    model,
+    pixel_values,
+    g_pixel_values,
+    text_embeds,
+    seg_token_id,
+    tokenizer,
+    device,
+):
+    """
+    Predict segmentation masks from image + text_embeds via the standard Sa2VA `[SEG]` mechanism.
+
+    This mirrors `forward_mask_with_text_embeds` but returns `pred_masks` and does not compute any loss.
+    """
+    batch_size = pixel_values.shape[0]
+
+    IMG_CONTEXT = '<IMG_CONTEXT>'
+    NUM_IMG_TOKENS = 256
+
+    from projects.glamm.datasets.utils.utils import SEG_QUESTIONS, ANSWER_LIST
+
+    question_template = random.choice(SEG_QUESTIONS)
+    if "{class_name}" not in question_template:
+        raise ValueError(f"Unexpected SEG_QUESTIONS template: {question_template}")
+    q_prefix, q_suffix = question_template.split("{class_name}")
+
+    answer_template = random.choice(ANSWER_LIST)
+    if answer_template.count("[SEG]") != 1:
+        raise ValueError(f"Unexpected ANSWER_LIST template: {answer_template}")
+    a_prefix, a_suffix = answer_template.split("[SEG]")
+
+    img_str = f"<img>{IMG_CONTEXT * NUM_IMG_TOKENS}</img>"
+    human_prefix = f"<image>\n{q_prefix}".replace("<image>", img_str)
+    user_prefix_str = f"<|user|>\n{human_prefix}"
+    user_suffix_str = f"{q_suffix}<|end|><|assistant|>\n"
+
+    prefix_ids = tokenizer.encode(user_prefix_str, add_special_tokens=True)
+    suffix_ids = tokenizer.encode(user_suffix_str, add_special_tokens=False)
+    assistant_ids = (
+        tokenizer.encode(a_prefix, add_special_tokens=False)
+        + [seg_token_id]
+        + tokenizer.encode(a_suffix, add_special_tokens=False)
+        + tokenizer.encode("<|end|>", add_special_tokens=False)
+    )
+
+    caption_len = int(text_embeds.shape[1])
+    total_len = len(prefix_ids) + caption_len + len(suffix_ids) + len(assistant_ids)
+    total_len = _global_max_len(total_len, device=device)
+
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    input_ids = torch.full((batch_size, total_len), pad_token_id, dtype=torch.long, device=device)
+    attention_mask = torch.zeros(batch_size, total_len, dtype=torch.bool, device=device)
+    labels = torch.full((batch_size, total_len), -100, dtype=torch.long, device=device)
+
+    prefix_len = len(prefix_ids)
+    suffix_len = len(suffix_ids)
+    assistant_len = len(assistant_ids)
+
+    input_ids[:, :prefix_len] = torch.tensor(prefix_ids, device=device).unsqueeze(0)
+    input_ids[:, prefix_len + caption_len: prefix_len + caption_len + suffix_len] = torch.tensor(
+        suffix_ids, device=device
+    ).unsqueeze(0)
+    input_ids[:, prefix_len + caption_len + suffix_len: prefix_len + caption_len + suffix_len + assistant_len] = (
+        torch.tensor(assistant_ids, device=device).unsqueeze(0)
+    )
+
+    # Only supervise assistant answer (keeps `[SEG]` embedding extraction stable).
+    labels[:, prefix_len + caption_len + suffix_len: prefix_len + caption_len + suffix_len + assistant_len] = (
+        torch.tensor(assistant_ids, device=device).unsqueeze(0)
+    )
+
+    attention_mask[:, : prefix_len + caption_len + suffix_len + assistant_len] = True
+    position_ids = torch.arange(total_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    # Build base embeddings and inject image/vp embeddings into <IMG_CONTEXT> slots.
+    img_context_id = tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>')
+    if img_context_id is None or img_context_id < 0:
+        raise RuntimeError("Tokenizer missing <IMG_CONTEXT> token id")
+
+    # Build input embeddings: prefix + provided text_embeds + suffix + assistant ids.
+    embedding_layer = model.mllm.model.language_model.get_input_embeddings()
+    base_embeds = embedding_layer(input_ids)
+    input_embeds = base_embeds.clone()
+    input_embeds[:, prefix_len: prefix_len + caption_len, :] = text_embeds.to(input_embeds.dtype)
+
+    # Replace image token positions with vision embeddings (no vp tokens in RefCOCO-style prompt).
+    vision_dtype = model.mllm.model.vision_model.dtype
+    with torch.no_grad():
+        concat_images = torch.stack([pixel_values[i] for i in range(batch_size)], dim=0).to(device=device, dtype=vision_dtype)
+        vit_embeds = model.mllm.model.extract_feature(concat_images).to(dtype=input_embeds.dtype)
+
+    B, N, D = input_embeds.shape
+    input_embeds_flat = input_embeds.reshape(B * N, D)
+    input_ids_flat = input_ids.reshape(B * N)
+    selected = (input_ids_flat == img_context_id)
+    n_selected = int(selected.sum().item())
+    vit_flat = vit_embeds.reshape(-1, D)
+    if n_selected > int(vit_flat.shape[0]):
+        expand = n_selected // int(vit_flat.shape[0]) + 1
+        vit_flat = torch.cat([vit_flat] * expand, dim=0)
+    input_embeds_flat = input_embeds_flat.clone()
+    input_embeds_flat[selected] = vit_flat[:n_selected]
+    input_embeds = input_embeds_flat.reshape(B, N, D)
+
+    # Run LLM transformer to get hidden states.
+    llm = model.mllm.model.language_model
+    base = getattr(llm, "base_model", None)
+    causal_lm = base.model if (base is not None and hasattr(base, "model")) else llm
+    transformer = getattr(causal_lm, "model", None)
+    if transformer is None:
+        outputs = llm(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+        )
+        hidden_states = outputs.hidden_states[-1]
+    else:
+        outputs = transformer(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+        )
+        hidden_states = outputs.hidden_states[-1] if getattr(outputs, "hidden_states", None) is not None else outputs[0]
+
+    hidden_states_transformed = model.text_hidden_fcs(hidden_states)
+
+    seg_mask = input_ids == seg_token_id
+    seg_counts = seg_mask.int().sum(-1)
+    if seg_counts.sum() == 0:
+        raise RuntimeError("No [SEG] token found while predicting mask")
+    pred_embeddings = hidden_states_transformed[seg_mask]
+
+    # SAM2 forward for mask prediction
+    g_pixel_values = g_pixel_values.to(device)
+    g_pixel_values = torch.stack(
+        [model.grounding_encoder.preprocess_image(g_pixel_values[i]) for i in range(batch_size)],
+        dim=0,
+    )
+    num_objs = 1
+    sam_states = model.grounding_encoder.get_sam2_embeddings(g_pixel_values, expand_size=num_objs)
+
+    pred_list = torch.split(pred_embeddings, seg_counts.tolist(), dim=0)
+    pred_list = [item for item in pred_list if len(item) > 0]
+    if not pred_list:
+        raise RuntimeError("Empty [SEG] embeddings split")
+    lang_embeds = torch.stack([emb[0] for emb in pred_list], dim=0)[:, None]
+    pred_masks = model.grounding_encoder.inject_language_embd(sam_states, lang_embeds, nf_nobj=(batch_size, num_objs))
+    return pred_masks
+
+
+def compute_dam_caption_ce_loss(
+    model,
+    pixel_values,
+    prompt_masks,
+    captions,
+    tokenizer,
+    max_caption_len,
+    device,
+):
+    """
+    Teacher-forced caption CE loss on DAM captioning prompt (mask -> caption).
+
+    `prompt_masks` is a single-region grid mask per sample (B,16,16) uint8/bool.
+    """
+    batch_size = pixel_values.shape[0]
+    IMG_CONTEXT = '<IMG_CONTEXT>'
+    NUM_IMG_TOKENS = 256
+
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+    input_ids_list = []
+    labels_list = []
+    user_lens = []
+
+    for i in range(batch_size):
+        pm = prompt_masks[i]
+        K = _count_vp_tokens_from_prompt_mask(pm, num_img_tokens=NUM_IMG_TOKENS, device=device)
+        img_str = f'<img>{IMG_CONTEXT * NUM_IMG_TOKENS}</img>'
+        human_input = (
+            f"{img_str}\n"
+            f"There are 1 part regions in the picture: region1<vp>{IMG_CONTEXT * K}</vp>.\n"
+            "Please generate a detailed description for the given image region."
+        )
+        user_prompt = f"<|user|>\n{human_input}<|end|>\n<|assistant|>\n"
+        user_ids = tokenizer.encode(user_prompt, add_special_tokens=True)
+        user_lens.append(len(user_ids))
+
+        cap_ids = tokenizer.encode(str(captions[i]), add_special_tokens=False)
+        cap_ids = cap_ids[:max_caption_len]
+        if len(cap_ids) < max_caption_len:
+            cap_ids = cap_ids + [pad_token_id] * (max_caption_len - len(cap_ids))
+
+        full_ids = user_ids + cap_ids
+        full_labels = [-100] * len(user_ids) + cap_ids
+        input_ids_list.append(full_ids)
+        labels_list.append(full_labels)
+
+    max_len = max(len(ids) for ids in input_ids_list)
+    max_len = _global_max_len(max_len, device=device)
+    input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
+    labels = torch.full((batch_size, max_len), -100, dtype=torch.long, device=device)
+    attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)
+    for i, (ids, labs) in enumerate(zip(input_ids_list, labels_list)):
+        input_ids[i, :len(ids)] = torch.tensor(ids, device=device)
+        labels[i, :len(labs)] = torch.tensor(labs, device=device)
+        attention_mask[i, :len(ids)] = True
+    position_ids = torch.arange(max_len, device=device).unsqueeze(0).expand(batch_size, -1)
+
+    img_context_id = tokenizer.convert_tokens_to_ids('<IMG_CONTEXT>')
+    if img_context_id is None or img_context_id < 0:
+        raise RuntimeError("Tokenizer missing <IMG_CONTEXT> token id")
+
+    # vit/vp embeds
+    vision_dtype = model.mllm.model.vision_model.dtype
+    pixel_values_list = [pixel_values[i] for i in range(batch_size)]
+    with torch.no_grad():
+        pv = [x.unsqueeze(0) if x.ndim == 3 else x for x in pixel_values_list]
+        concat_images = torch.cat([x.to(vision_dtype) for x in pv], dim=0).to(device)
+        image_flags = (torch.sum(concat_images, dim=(1, 2, 3)) != 0).long()
+        vit_embeds = model.mllm.model.extract_feature(concat_images)
+        vit_embeds = vit_embeds[image_flags == 1]
+
+    prompt_masks_list = [prompt_masks[i:i + 1].to(device) for i in range(batch_size)]
+    if len(vit_embeds) != batch_size:
+        raise RuntimeError(f"Unexpected vit batch size {len(vit_embeds)} (expected {batch_size})")
+    vp_overall_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+    C = vit_embeds.shape[-1]
+    vp_parts = []
+    i_vp_img = 0
+    for i_img in range(len(vit_embeds)):
+        tile = vit_embeds[i_img].reshape(-1, C)
+        vp_parts.append(tile)
+        if bool(vp_overall_mask[i_img].item()):
+            objects_prompt_masks = prompt_masks_list[i_vp_img].to(vit_embeds.device).bool()
+            n_obj = len(objects_prompt_masks)
+            masks_flat = objects_prompt_masks.reshape(n_obj, -1)
+            hw = tile.shape[0]
+            if masks_flat.shape[1] != hw:
+                side = int(hw ** 0.5)
+                m = objects_prompt_masks.float().unsqueeze(1)
+                m = F.interpolate(m, size=(side, side), mode='nearest').squeeze(1)
+                masks_flat = m.bool().reshape(n_obj, -1)
+            tile_rep = tile.unsqueeze(0).repeat(n_obj, 1, 1)
+            vp_parts.append(tile_rep[masks_flat])
+            i_vp_img += 1
+    vp_embeds = torch.cat(vp_parts, dim=0).to(device)
+
+    embedding_layer = model.mllm.model.language_model.get_input_embeddings()
+    input_embeds = embedding_layer(input_ids)
+    B, N, D = input_embeds.shape
+    input_embeds_flat = input_embeds.reshape(B * N, D)
+    input_ids_flat = input_ids.reshape(B * N)
+    selected = (input_ids_flat == img_context_id)
+    n_selected = int(selected.sum().item())
+    if n_selected != int(vp_embeds.shape[0]):
+        raise RuntimeError(
+            f"IMG_CONTEXT token mismatch in compute_dam_caption_ce_loss: selected={n_selected} vp={int(vp_embeds.shape[0])}"
+        )
+    input_embeds_flat = input_embeds_flat.clone()
+    input_embeds_flat[selected] = vp_embeds.to(input_embeds_flat.dtype)
+    input_embeds = input_embeds_flat.reshape(B, N, D)
+
+    llm = model.mllm.model.language_model
+    base = getattr(llm, "base_model", None)
+    causal_lm = base.model if (base is not None and hasattr(base, "model")) else llm
+    transformer = getattr(causal_lm, "model", None)
+    lm_head = getattr(causal_lm, "lm_head", None)
+    if transformer is None or lm_head is None:
+        outputs = llm(
+            inputs_embeds=input_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            labels=labels,
+            output_hidden_states=True,
+        )
+        return outputs.loss
+
+    outputs = transformer(
+        inputs_embeds=input_embeds,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        output_hidden_states=True,
+    )
+    hidden_states = outputs.hidden_states[-1] if getattr(outputs, "hidden_states", None) is not None else outputs[0]
+
+    shift_labels = labels[:, 1:].contiguous()
+    valid = shift_labels != -100
+    if not valid.any():
+        return torch.tensor(0.0, device=device)
+    h = hidden_states[:, :-1, :][valid]
+    logits_small = lm_head(h).float()
+    loss = F.cross_entropy(logits_small, shift_labels[valid], ignore_index=-100, reduction="mean")
+    return loss

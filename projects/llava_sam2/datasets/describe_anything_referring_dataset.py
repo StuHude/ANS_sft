@@ -3,8 +3,10 @@
 
 import os
 import io
+import json
 import pickle as pkl
 import logging
+import tarfile
 from typing import List, Tuple, Union, Optional, Dict, Any, Callable
 
 import torch
@@ -75,6 +77,269 @@ def _decode_rle_to_mask(mask_rle: Dict[str, Any]) -> torch.Tensor:
     m = (m > 0.5).float().unsqueeze(0)  # (1,H,W)
     return m
 
+
+def _is_valid_region_like(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    cap = item.get("caption", None)
+    mrl = item.get("mask_rle", None)
+    if not (isinstance(cap, str) and cap.strip()):
+        return False
+    if not (isinstance(mrl, dict) and ("size" in mrl) and ("counts" in mrl)):
+        return False
+    return True
+
+
+def _normalize_dam_annotations(ann: Any) -> List[Dict[str, Any]]:
+    """
+    Normalize one DAM annotations.json entry into a list of region dicts.
+    - Some splits store {id: {caption, mask_rle, ...}}.
+    - Some splits store {id: [{caption, mask_rle, ...}, ...]}.
+    """
+    if isinstance(ann, list):
+        return [it for it in ann if _is_valid_region_like(it)]
+    if isinstance(ann, dict):
+        if _is_valid_region_like(ann):
+            return [ann]
+        region_list = _as_region_list(ann)
+        return [it for it in region_list if _is_valid_region_like(it)]
+    return []
+
+
+def _default_dam_root() -> str:
+    # Repo-relative default (works for /data/xyc/ANS layout).
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    return os.path.join(repo_root, "data", "describe-anything-dataset", "describe-anything-dataset")
+
+
+def _build_dam_tar_index(images_dir: str, cache_path: Optional[str] = None) -> Dict[str, str]:
+    """
+    Build a mapping: sample_id -> shard_tar_path by scanning `*.pickle` entries in each tar shard.
+    This keeps runtime random access O(1) per sample without brute-forcing all shards.
+    """
+    if cache_path and os.path.isfile(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                return pkl.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load DAM tar index cache: {cache_path}: {e}")
+
+    tar_paths = sorted(
+        [os.path.join(images_dir, n) for n in os.listdir(images_dir) if n.endswith(".tar")]
+    )
+    index: Dict[str, str] = {}
+    for tp in tar_paths:
+        try:
+            with tarfile.open(tp, "r") as tf:
+                for name in tf.getnames():
+                    if not name.endswith(".pickle"):
+                        continue
+                    sample_id = os.path.splitext(os.path.basename(name))[0]
+                    index[sample_id] = tp
+        except Exception as e:
+            logger.warning(f"Failed to scan DAM shard: {tp}: {e}")
+
+    if cache_path:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pkl.dump(index, f)
+        except Exception as e:
+            logger.warning(f"Failed to write DAM tar index cache: {cache_path}: {e}")
+    return index
+
+
+class _TarShardReader:
+    def __init__(self, max_open: int = 8):
+        self.max_open = int(max_open)
+        self._open: Dict[str, tarfile.TarFile] = {}
+        self._lru: List[str] = []
+
+    def _touch(self, path: str) -> None:
+        if path in self._lru:
+            self._lru.remove(path)
+        self._lru.append(path)
+
+    def get(self, path: str) -> tarfile.TarFile:
+        tf = self._open.get(path, None)
+        if tf is not None:
+            self._touch(path)
+            return tf
+        tf = tarfile.open(path, "r")
+        self._open[path] = tf
+        self._touch(path)
+        while len(self._lru) > self.max_open:
+            old = self._lru.pop(0)
+            old_tf = self._open.pop(old, None)
+            if old_tf is not None:
+                try:
+                    old_tf.close()
+                except Exception:
+                    pass
+        return tf
+
+    def close(self) -> None:
+        for tf in self._open.values():
+            try:
+                tf.close()
+            except Exception:
+                pass
+        self._open.clear()
+        self._lru.clear()
+
+
+@BUILDER.register_module()
+class DescribeAnythingLocalRegionDataset(Dataset):
+    """
+    Local loader for the *extracted* Describe Anything Dataset folder layout:
+      {data_root}/{SPLIT}/annotations.json
+      {data_root}/{SPLIT}/images/*.tar  (each tar contains *.jpg + *.pickle)
+
+    Returns raw tensors suitable for Sa2VA training loops:
+      - pixel_values: (3,448,448) ImageNet normalized (InternVL)
+      - g_pixel_values: (3,1024,1024) uint8 [0,255] (SAM2)
+      - prompt_masks: (16,16) uint8 {0,1} (visual prompt grid)
+      - masks_1024: (1024,1024) float {0,1} (GT mask)
+      - caption: str
+      - dataset_type: str
+    """
+
+    def __init__(
+        self,
+        data_root: Optional[str] = None,
+        splits: Union[str, List[str], Tuple[str, ...]] = ("SAV",),
+        max_samples: Optional[int] = None,
+        cache_dir: Optional[str] = None,
+        tar_cache_max_open: int = 8,
+        **_ignore_kwargs,
+    ) -> None:
+        self.data_root = data_root or _default_dam_root()
+        if isinstance(splits, str):
+            self.splits = [splits]
+        else:
+            self.splits = list(splits)
+        self.max_samples = int(max_samples) if (max_samples is not None) else None
+        self.cache_dir = cache_dir
+        self._tar_reader = _TarShardReader(max_open=tar_cache_max_open)
+        self._ann_by_split: Dict[str, Dict[str, Any]] = {}
+
+        # Transforms
+        self._img_448 = transforms.Compose([
+            transforms.Resize((INTERNVL_IMAGE_SIZE, INTERNVL_IMAGE_SIZE), interpolation=InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ])
+        self._img_1024 = transforms.Compose([
+            transforms.Resize((1024, 1024), interpolation=InterpolationMode.BICUBIC),
+            transforms.ToTensor(),  # [0,1]
+        ])
+        self._mask_1024 = transforms.Compose([
+            transforms.Resize((1024, 1024), interpolation=InterpolationMode.NEAREST),
+        ])
+
+        # Build (sample_id, split, region_idx) list and shard indexes.
+        self._samples: List[Tuple[str, str, int]] = []
+        self._tar_index_by_split: Dict[str, Dict[str, str]] = {}
+        for sp in self.splits:
+            split_dir = os.path.join(self.data_root, sp)
+            ann_path = os.path.join(split_dir, "annotations.json")
+            img_dir = os.path.join(split_dir, "images")
+            if not os.path.isfile(ann_path):
+                raise FileNotFoundError(f"DAM annotations not found: {ann_path}")
+            if not os.path.isdir(img_dir):
+                raise FileNotFoundError(f"DAM images dir not found: {img_dir}")
+
+            with open(ann_path, "r") as f:
+                ann = json.load(f)
+            if not isinstance(ann, dict):
+                raise RuntimeError(f"Unexpected DAM annotations.json format: {ann_path} type={type(ann)}")
+            self._ann_by_split[sp] = ann
+
+            for sample_id, entry in ann.items():
+                regions = _normalize_dam_annotations(entry)
+                for ridx in range(len(regions)):
+                    self._samples.append((str(sample_id), sp, ridx))
+
+            cache_path = None
+            if cache_dir is not None:
+                cache_path = os.path.join(cache_dir, f"dam_tar_index_{sp}.pkl")
+            self._tar_index_by_split[sp] = _build_dam_tar_index(img_dir, cache_path=cache_path)
+
+        if self.max_samples is not None:
+            self._samples = self._samples[: self.max_samples]
+
+        logger.info(
+            "DescribeAnythingLocalRegionDataset | "
+            f"data_root={self.data_root}, splits={self.splits}, samples={len(self._samples)}, "
+            f"cache_dir={self.cache_dir}"
+        )
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def _load_image_from_tar(self, split: str, sample_id: str) -> Image.Image:
+        tp = self._tar_index_by_split[split].get(sample_id, None)
+        if tp is None:
+            raise KeyError(f"Sample id not found in tar index: split={split} id={sample_id}")
+        tf = self._tar_reader.get(tp)
+
+        # SAV stores multiple frames as "{id}.{t}.jpg"; others commonly store "{id}.jpg".
+        candidates = [f"{sample_id}.0.jpg", f"{sample_id}.jpg"]
+        member = None
+        for cand in candidates:
+            try:
+                member = tf.getmember(cand)
+                break
+            except KeyError:
+                continue
+        if member is None:
+            # Fallback: find any jpg starting with sample_id (best-effort).
+            prefix = f"{sample_id}."
+            for n in tf.getnames():
+                if n.startswith(prefix) and n.endswith(".jpg"):
+                    member = tf.getmember(n)
+                    break
+        if member is None:
+            raise KeyError(f"JPG not found in shard: split={split} id={sample_id}")
+
+        f = tf.extractfile(member)
+        if f is None:
+            raise RuntimeError(f"Failed to extract {member.name} from {tp}")
+        return Image.open(io.BytesIO(f.read())).convert("RGB")
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        sample_id, split, ridx = self._samples[idx]
+        ann = self._ann_by_split[split]
+        entry = ann.get(sample_id, None)
+        if entry is None:
+            return self.__getitem__((idx + 1) % len(self))
+        regions = _normalize_dam_annotations(entry)
+        if not regions:
+            return self.__getitem__((idx + 1) % len(self))
+        region = regions[ridx % len(regions)]
+
+        caption = str(region["caption"]).strip()
+        mask_rle = region["mask_rle"]
+
+        img = self._load_image_from_tar(split, sample_id)
+        img_448 = self._img_448(img)  # (3,448,448) normalized
+        img_1024 = self._img_1024(img)  # (3,1024,1024) float [0,1]
+        g_pixel_values = (img_1024 * 255).byte()
+
+        mask_1hw = _decode_rle_to_mask(mask_rle)  # (1,H,W)
+        # Resize mask to 1024 for GT and to 16x16 for prompt grid.
+        mask_1024 = self._mask_1024(mask_1hw)  # (1,1024,1024)
+        prompt_masks = F.adaptive_avg_pool2d(mask_1024, (GRID_SIZE, GRID_SIZE))  # (1,16,16)
+        prompt_masks = (prompt_masks > 0.5).to(torch.uint8).squeeze(0)  # (16,16)
+
+        return {
+            "pixel_values": img_448,
+            "g_pixel_values": g_pixel_values,
+            "prompt_masks": prompt_masks,
+            "masks_1024": mask_1024.squeeze(0),
+            "caption": caption,
+            "dataset_type": f"dam_{split.lower()}",
+        }
 
 def _wrap_image_processor(proc: Any) -> Callable[[Image.Image], torch.Tensor]:
     if callable(proc):
