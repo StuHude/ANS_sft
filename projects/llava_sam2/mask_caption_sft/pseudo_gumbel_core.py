@@ -851,11 +851,14 @@ def predict_masks_with_text_embeds(
     seg_token_id,
     tokenizer,
     device,
+    return_llm_loss: bool = False,
 ):
     """
     Predict segmentation masks from image + text_embeds via the standard Sa2VA `[SEG]` mechanism.
 
-    This mirrors `forward_mask_with_text_embeds` but returns `pred_masks` and does not compute any loss.
+    This mirrors `forward_mask_with_text_embeds` but returns `pred_masks`.
+    If `return_llm_loss` is True, also compute an LM loss on the assistant answer
+    (to keep `[SEG]` generation behavior anchored).
     """
     batch_size = pixel_values.shape[0]
 
@@ -952,6 +955,7 @@ def predict_masks_with_text_embeds(
     base = getattr(llm, "base_model", None)
     causal_lm = base.model if (base is not None and hasattr(base, "model")) else llm
     transformer = getattr(causal_lm, "model", None)
+    lm_head = getattr(causal_lm, "lm_head", None)
     if transformer is None:
         outputs = llm(
             inputs_embeds=input_embeds,
@@ -968,6 +972,29 @@ def predict_masks_with_text_embeds(
             output_hidden_states=True,
         )
         hidden_states = outputs.hidden_states[-1] if getattr(outputs, "hidden_states", None) is not None else outputs[0]
+
+    llm_loss = None
+    if return_llm_loss:
+        if lm_head is None:
+            outputs = llm(
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                output_hidden_states=False,
+            )
+            llm_loss = outputs.loss if getattr(outputs, "loss", None) is not None else torch.tensor(0.0, device=device)
+        else:
+            shift_labels = labels[:, 1:].contiguous()
+            valid = shift_labels != -100
+            if valid.any():
+                h = hidden_states[:, :-1, :][valid]
+                logits_small = lm_head(h).float()
+                llm_loss = F.cross_entropy(
+                    logits_small, shift_labels[valid], ignore_index=-100, reduction="mean"
+                )
+            else:
+                llm_loss = torch.tensor(0.0, device=device)
 
     hidden_states_transformed = model.text_hidden_fcs(hidden_states)
 
@@ -992,6 +1019,8 @@ def predict_masks_with_text_embeds(
         raise RuntimeError("Empty [SEG] embeddings split")
     lang_embeds = torch.stack([emb[0] for emb in pred_list], dim=0)[:, None]
     pred_masks = model.grounding_encoder.inject_language_embd(sam_states, lang_embeds, nf_nobj=(batch_size, num_objs))
+    if return_llm_loss:
+        return pred_masks, llm_loss
     return pred_masks
 
 
@@ -1022,6 +1051,8 @@ def compute_dam_caption_ce_loss(
     for i in range(batch_size):
         pm = prompt_masks[i]
         K = _count_vp_tokens_from_prompt_mask(pm, num_img_tokens=NUM_IMG_TOKENS, device=device)
+        if K > NUM_IMG_TOKENS:
+            K = NUM_IMG_TOKENS
         img_str = f'<img>{IMG_CONTEXT * NUM_IMG_TOKENS}</img>'
         human_input = (
             f"{img_str}\n"
@@ -1042,8 +1073,10 @@ def compute_dam_caption_ce_loss(
         input_ids_list.append(full_ids)
         labels_list.append(full_labels)
 
-    max_len = max(len(ids) for ids in input_ids_list)
-    max_len = _global_max_len(max_len, device=device)
+    max_len = max(len(ids) for ids in input_ids_list) if input_ids_list else 0
+    # Guard against pathological prompt lengths (e.g., corrupted captions).
+    if max_len <= 0 or max_len > 8192:
+        return torch.tensor(0.0, device=device)
     input_ids = torch.full((batch_size, max_len), pad_token_id, dtype=torch.long, device=device)
     labels = torch.full((batch_size, max_len), -100, dtype=torch.long, device=device)
     attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool, device=device)

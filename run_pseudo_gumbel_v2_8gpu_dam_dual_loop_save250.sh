@@ -1,5 +1,5 @@
 #!/bin/bash
-# 8GPU training with DAM dual-loop enabled; saves every 250 optimizer steps.
+# 8GPU training with DAM dual-loop enabled; saves + evals every 200 optimizer steps.
 set -euo pipefail
 
 if ! docker ps | grep -q vlm-env; then
@@ -8,7 +8,7 @@ if ! docker ps | grep -q vlm-env; then
   sleep 2
 fi
 
-OUT_DIR=${OUT_DIR:-./work_dirs/pseudo_gumbel_v2_dam_dual_loop_8gpu_save250}
+OUT_DIR=${OUT_DIR:-./work_dirs/pseudo_gumbel_v2_dam_dual_loop_8gpu_save200}
 MASTER_PORT=${MASTER_PORT:-29721}
 
 mkdir -p "${OUT_DIR}"
@@ -52,12 +52,20 @@ nohup bash -lc \"torchrun --nproc_per_node=8 --master_port=${MASTER_PORT} \
   --num_workers 4 \
   --ref_num_workers 0 \
   --log_interval 10 \
-  --save_interval 250 \
+  --save_interval 200 \
+  --eval_interval 5 \
+  --max_steps 5 \
+  --eval_max_samples 50 \
+  --eval_max_texts_per_image 1 \
+  --eval_split val \
+  --eval_stop_threshold 0.5 \
+  ${EVAL_PROMPT_TEMPLATE:+--eval_prompt_template ${EVAL_PROMPT_TEMPLATE}} \
   --enable_dam_dual_loop \
   --dam_data_root /data/xyc/ANS/data/describe-anything-dataset/describe-anything-dataset \
   --dam_splits SAV,COCOStuff,LVIS,Mapillary,OpenImages,PACO \
   --dam_num_workers 0 \
-  --dam_beta 0.5\" \
+  --dam_beta 0.5 \
+  --dam_seg_llm_loss_weight 1.0\" \
   > ${OUT_DIR}/train.log 2>&1 &
 
 echo \$! > ${OUT_DIR}/train.pid

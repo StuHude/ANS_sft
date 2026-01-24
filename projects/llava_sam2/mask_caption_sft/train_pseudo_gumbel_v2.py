@@ -24,6 +24,12 @@ import os
 import sys
 import argparse
 import random
+import math
+import json
+import time
+import copy
+import inspect
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,6 +125,11 @@ def parse_args():
     parser.add_argument('--dam_max_samples', type=int, default=None, help='Optional cap on DAM samples (debug).')
     parser.add_argument('--dam_beta', type=float, default=0.5, help='Beta weight for Loop2 loss (after grad surgery).')
     parser.add_argument(
+        '--dam_seg_llm_loss_weight',
+        type=float,
+        default=1.0,
+        help='Weight for the segmentation LM loss inside Loop2 (caption->mask step).')
+    parser.add_argument(
         '--dam_caption_len',
         type=int,
         default=None,
@@ -135,6 +146,54 @@ def parse_args():
                         help='RefCOCO dataloader workers (keep low to reduce shm/CPU mem).')
     parser.add_argument('--log_interval', type=int, default=10)
     parser.add_argument('--save_interval', type=int, default=500)
+    parser.add_argument(
+        '--eval_interval',
+        type=int,
+        default=0,
+        help='Run RefCOCO eval every N optimizer steps (0 disables).')
+    parser.add_argument(
+        '--eval_split',
+        type=str,
+        default='val',
+        help='RefCOCO split for automatic eval.')
+    parser.add_argument(
+        '--eval_max_samples',
+        type=int,
+        default=None,
+        help='Optional cap on RefCOCO eval samples (debug).')
+    parser.add_argument(
+        '--eval_max_texts_per_image',
+        type=int,
+        default=None,
+        help='Optional cap on RefCOCO eval expressions per image (debug).')
+    parser.add_argument(
+        '--eval_max_new_tokens',
+        type=int,
+        default=None,
+        help='Optional cap on generation length during eval (debug).')
+    parser.add_argument(
+        '--eval_force_seg',
+        action='store_true',
+        help='Force a fixed assistant answer containing `[SEG]` during eval (debug only).')
+    parser.add_argument(
+        '--disable_internal_eval',
+        action='store_true',
+        help='Disable all in-process evals (including save-time variant evals).')
+    parser.add_argument(
+        '--eval_stop_threshold',
+        type=float,
+        default=None,
+        help='If set, stop training when eval Acc drops below this value.')
+    parser.add_argument(
+        '--eval_refcoco_image_folder',
+        type=str,
+        default=None,
+        help='Override RefCOCO image folder for automatic eval.')
+    parser.add_argument(
+        '--eval_prompt_template',
+        type=str,
+        default=None,
+        help='Optional prompt template name for eval (e.g., qwen_chat). Defaults to training template.')
     parser.add_argument(
         '--save_full_model',
         action='store_true',
@@ -472,6 +531,7 @@ class PseudoGumbelTrainerV2:
         self.enable_dam_dual_loop = bool(getattr(args, "enable_dam_dual_loop", False))
         self.dam_beta = float(getattr(args, "dam_beta", 0.5))
         self.dam_caption_len = int(getattr(args, "dam_caption_len", None) or self.max_caption_len)
+        self.dam_seg_llm_loss_weight = float(getattr(args, "dam_seg_llm_loss_weight", 1.0))
         self.ref_llm_loss_weight = float(getattr(args, 'ref_llm_loss_weight', 1.0))
         self.pseudo_llm_loss_weight = float(getattr(args, 'pseudo_llm_loss_weight', 1.0))
         self.masked_lm_loss_weight = float(getattr(args, 'masked_lm_loss_weight', 0.0))
@@ -500,8 +560,16 @@ class PseudoGumbelTrainerV2:
         self._dam_iter = iter(self.train_dataloader_dam) if self.train_dataloader_dam is not None else None
 
         # Params to apply gradient surgery on (trainables only).
-        self._trainable_params = [p for p in self.actual_model.parameters() if p.requires_grad]
+        self._trainable_params = []
+        self._trainable_param_names = []
+        for name, p in self.actual_model.named_parameters():
+            if p.requires_grad:
+                self._trainable_params.append(p)
+                self._trainable_param_names.append(name)
         self._accum_grads = None  # lazily initialized list aligned to _trainable_params
+        self._base_trainable_state = {
+            n: p.detach().cpu().clone() for n, p in self.actual_model.named_parameters() if p.requires_grad
+        }
 
     def _log_teacher_token_stats(self, pseudo_toks: torch.Tensor):
         """
@@ -791,6 +859,8 @@ class PseudoGumbelTrainerV2:
                     if self.args.max_steps is not None and self.global_step >= self.args.max_steps:
                         # Save once at the exact max step, then stop training.
                         self.save_checkpoint(f"checkpoint_step_{self.global_step}.pth")
+                        if not self.args.disable_internal_eval:
+                            self._run_variant_evals(self.global_step)
                         self.reached_max_steps = True
                         break
             except Exception:
@@ -810,6 +880,7 @@ class PseudoGumbelTrainerV2:
                     self.writer.add_scalar('train/llm_loss', loss_dict.get('llm_loss', 0), self.global_step)
                 if self.enable_dam_dual_loop and dam_loss_dict is not None:
                     self.writer.add_scalar('train/dam_caption_ce', dam_loss_dict.get('dam_caption_ce', 0), self.global_step)
+                    self.writer.add_scalar('train/dam_seg_llm_loss', dam_loss_dict.get('dam_seg_llm_loss', 0), self.global_step)
 
                 pbar.set_postfix({
                     'loss': f"{loss.item():.4f}",
@@ -822,6 +893,12 @@ class PseudoGumbelTrainerV2:
             # Save checkpoint
             if self.global_step > 0 and self.global_step % self.args.save_interval == 0:
                 self.save_checkpoint(f"checkpoint_step_{self.global_step}.pth")
+                if not self.args.disable_internal_eval:
+                    self._run_variant_evals(self.global_step)
+
+            # Periodic eval (independent from checkpoint saving).
+            if (not self.args.disable_internal_eval) and self.args.eval_interval and self.global_step > 0 and self.global_step % self.args.eval_interval == 0:
+                self._run_refcoco_eval(self.global_step)
 
             if self.reached_max_steps:
                 break
@@ -838,6 +915,338 @@ class PseudoGumbelTrainerV2:
             print(f"Dataset mix: {dataset_type_counts}")
 
         return {'loss': sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0}
+
+    def _resolve_refcoco_image_folder(self) -> str:
+        if self.args.eval_refcoco_image_folder:
+            return self.args.eval_refcoco_image_folder
+        if self.args.refcoco_dir:
+            candidate = Path(self.args.refcoco_dir) / 'refcoco' / 'coco2014' / 'train2014'
+            if candidate.exists():
+                return str(candidate)
+        return './data/ref_seg/refcoco/coco2014/train2014/'
+
+    def _run_refcoco_eval(self, step: int):
+        if not self.args.refcoco_dir:
+            return None
+
+        eval_dir = (Path(__file__).parent.parent / "evaluation").resolve()
+        eval_dir_str = str(eval_dir)
+        if eval_dir_str not in sys.path:
+            sys.path.insert(0, eval_dir_str)
+
+        from projects.llava_sam2.evaluation.dataset.RES import RESDataset
+        from projects.llava_sam2.evaluation.utils import collect_results_cpu, get_dist_info, get_rank, barrier
+        from projects.llava_sam2.evaluation.refcoco_eval import (
+            to_list_of_masks,
+            to_numpy_mask,
+            mask_to_rle,
+        )
+
+        rank = get_rank() if dist.is_available() and dist.is_initialized() else 0
+        world_size = get_dist_info()[1] if dist.is_available() and dist.is_initialized() else 1
+
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        model.eval()
+
+        image_folder = self._resolve_refcoco_image_folder()
+        dataset = RESDataset(
+            image_folder=image_folder,
+            dataset_name='refcoco',
+            data_path=self.args.refcoco_dir,
+            split=self.args.eval_split,
+        )
+        if self.args.eval_max_samples is not None:
+            from torch.utils.data import Subset
+            dataset = Subset(dataset, list(range(min(self.args.eval_max_samples, len(dataset)))))
+
+        n_samples = len(dataset)
+        per_rank_samples = math.ceil(n_samples / world_size) + 1
+        per_rank_ids = range(
+            per_rank_samples * rank,
+            min(n_samples, per_rank_samples * (rank + 1)),
+        )
+
+        results = []
+        local_no_seg = 0
+        local_total_texts = 0
+        start_time = time.time()
+        debug_printed = False
+        from projects.llava_sam2.models.utils import dynamic_preprocess
+        from projects.llava_sam2.models.llava_sam2 import get_seg_hidden_states
+
+        # Pick eval prompt template (override if requested).
+        eval_template = self.prompt_template
+        if self.args.eval_prompt_template:
+            eval_template = getattr(PROMPT_TEMPLATE, self.args.eval_prompt_template)
+
+        # Prepare inference config for VideoLLaVASAMModel if needed.
+        if hasattr(model, 'preparing_for_generation'):
+            try:
+                model.preparing_for_generation(metainfo={'template': eval_template})
+            except TypeError:
+                # Some model variants use a different signature; ignore and proceed.
+                pass
+        old_max_new = None
+        if self.args.eval_max_new_tokens is not None and hasattr(model, 'gen_config'):
+            old_max_new = getattr(model.gen_config, 'max_new_tokens', None)
+            model.gen_config.max_new_tokens = int(self.args.eval_max_new_tokens)
+
+        def _generate_with_vision(input_ids: torch.Tensor, attention_mask: torch.Tensor, pixel_values: torch.Tensor):
+            """Mimic InternVL.generate but avoid passing `return_dict` to HF generate."""
+            internvl = model.mllm
+            device = input_ids.device
+
+            pixel_values = pixel_values.to(device=device, dtype=internvl.model.vision_model.dtype)
+            vit_embeds = internvl.model.extract_feature(pixel_values)
+            image_flags = torch.sum(pixel_values, dim=(1, 2, 3)) != 0
+            vit_embeds = vit_embeds[image_flags == 1]
+
+            input_embeds = internvl.model.language_model.get_input_embeddings()(input_ids)
+            B, N, C = input_embeds.shape
+            input_embeds = input_embeds.reshape(B * N, C)
+            ids_flat = input_ids.reshape(B * N)
+
+            img_context_id = internvl.model.img_context_token_id
+            image_pad_id = self.tokenizer.convert_tokens_to_ids('<|image_pad|>')
+            selected = (ids_flat == img_context_id)
+            if image_pad_id is not None and image_pad_id >= 0 and image_pad_id != img_context_id:
+                selected = selected | (ids_flat == image_pad_id)
+            if selected.sum() == 0:
+                return None, 0, 0
+
+            flat_vit = vit_embeds.reshape(-1, C).to(input_embeds.device)
+            if selected.sum().item() != flat_vit.shape[0]:
+                min_tokens = min(int(selected.sum().item()), int(flat_vit.shape[0]))
+                input_embeds[selected][:min_tokens] = flat_vit[:min_tokens]
+            else:
+                input_embeds[selected] = flat_vit
+
+            input_embeds = input_embeds.reshape(B, N, C)
+            outputs = internvl.model.language_model.generate(
+                inputs_embeds=input_embeds,
+                attention_mask=attention_mask.to(device),
+                generation_config=model.gen_config,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+                use_cache=True,
+            )
+            return outputs, int(selected.sum().item()), int(flat_vit.shape[0])
+
+        with torch.no_grad():
+            for idx in per_rank_ids:
+                data_batch = dataset[idx]
+
+                gt_masks_list = to_list_of_masks(data_batch['gt_masks'])
+                gt_rle = mask_to_rle(gt_masks_list)
+                prediction = {'img_id': data_batch['img_id'], 'gt_masks': gt_rle}
+
+                texts = data_batch['text']
+                if self.args.eval_max_texts_per_image is not None:
+                    texts = texts[:self.args.eval_max_texts_per_image]
+
+                image = data_batch['image']
+                ori_w, ori_h = image.size
+
+                # Prepare vision inputs (aligned with Sa2VA predict_forward).
+                g_image = np.array(image)
+                g_image = model.extra_image_processor.apply_image(g_image)
+                g_pixel_values = torch.from_numpy(g_image).permute(2, 0, 1).contiguous().to(model.torch_dtype)
+                g_pixel_values = torch.stack([
+                    model.grounding_encoder.preprocess_image(g_pixel_values)
+                ]).to(self.device)
+
+                images = dynamic_preprocess(
+                    image,
+                    model.min_dynamic_patch,
+                    model.max_dynamic_patch,
+                    model.image_size,
+                    model.use_thumbnail,
+                )
+                pixel_values = [model.transformer(img) for img in images]
+                pixel_values = torch.stack(pixel_values).to(model.torch_dtype).to(self.device)
+                num_image_tokens = pixel_values.shape[0] * model.patch_token
+                image_token_str = f'{model.IMG_START_TOKEN}{model.IMG_CONTEXT_TOKEN * num_image_tokens}{model.IMG_END_TOKEN}\n'
+
+                pred_masks = []
+                for text in texts:
+                    question = text.replace('<image>', image_token_str)
+                    input_text = eval_template['INSTRUCTION'].format(
+                        input=question, round=1, bot_name='BOT')
+                    input_ids = self.tokenizer.encode(input_text)
+                    input_ids = torch.tensor(input_ids, device=self.device).unsqueeze(0)
+                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+                    if (not debug_printed) and rank == 0:
+                        preview = input_text.replace('\n', '\\n')
+                        print(f"[EVAL] sample0 prompt: {preview[:500]}")
+
+                    generate_output, selected_tokens, vit_tokens = _generate_with_vision(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        pixel_values=pixel_values,
+                    )
+                    if (not debug_printed) and rank == 0 and generate_output is not None:
+                        decoded = self.tokenizer.decode(
+                            generate_output.sequences[0],
+                            skip_special_tokens=False,
+                        )
+                        print(f"[EVAL] sample0 selected={selected_tokens} vit={vit_tokens}")
+                        print(f"[EVAL] sample0 decoded: {decoded[:500]}")
+                        debug_printed = True
+
+                    pred_mask = None
+                    if generate_output is not None:
+                        hidden_states = generate_output.hidden_states
+                        last_hidden_states = [item[-1][0] for item in hidden_states]
+                        last_hidden_states = torch.cat(last_hidden_states, dim=0)
+                        seg_hidden_states = get_seg_hidden_states(
+                            last_hidden_states,
+                            generate_output.sequences[0][:-1],
+                            seg_id=model.seg_token_idx,
+                        )
+                        if len(seg_hidden_states) > 0:
+                            if len(seg_hidden_states) > 1:
+                                seg_hidden_states = seg_hidden_states[:1]
+                            seg_hidden_states = model.text_hidden_fcs(seg_hidden_states)
+                            seg_hidden_states = seg_hidden_states.to(dtype=torch.float32)
+
+                            sam_states = model.grounding_encoder.get_sam2_embeddings(g_pixel_values)
+                            if len(pixel_values) < 5:
+                                pred_mask = model.grounding_encoder.language_embd_inference(
+                                    sam_states, [seg_hidden_states] * pixel_values.shape[0]
+                                )
+                            else:
+                                pred_mask = model.grounding_encoder.language_embd_inference(
+                                    sam_states, [seg_hidden_states] * 5
+                                )
+                            pred_mask = F.interpolate(
+                                pred_mask,
+                                size=(ori_h, ori_w),
+                                mode='bilinear',
+                                align_corners=False,
+                            )
+                            pred_mask = pred_mask[:, 0]
+                            pred_mask = pred_mask.sigmoid() > 0.5
+                            pred_mask = pred_mask.int().detach().cpu().numpy()
+                    local_total_texts += 1
+                    if pred_mask is None or len(pred_mask) == 0:
+                        local_no_seg += 1
+                        if len(gt_masks_list) > 0:
+                            empty = np.zeros_like(gt_masks_list[0], dtype=np.uint8)
+                            pred_masks.append(mask_to_rle([empty]))
+                        else:
+                            pred_masks.append([])
+                    else:
+                        pred_masks.append(mask_to_rle([pred_mask[0]]))
+
+                prediction.update({'prediction_masks': pred_masks})
+                results.append(prediction)
+
+        tmpdir = os.path.join(str(self.output_dir), f'__eval_tmp_refcoco_{step}')
+        results = collect_results_cpu(results, len(dataset), tmpdir=tmpdir)
+
+        # Reduce no-seg stats across ranks.
+        if dist.is_available() and dist.is_initialized():
+            stat = torch.tensor([local_no_seg, local_total_texts], device=self.device, dtype=torch.long)
+            dist.all_reduce(stat, op=dist.ReduceOp.SUM)
+            local_no_seg, local_total_texts = stat.tolist()
+
+        metric = None
+        if rank == 0:
+            eval_dataset = dataset.dataset if hasattr(dataset, 'dataset') else dataset
+            metric = eval_dataset.evaluate(results, str(self.output_dir))
+            acc = float(metric.get('Acc', 0.0)) if isinstance(metric, dict) else None
+            if acc is not None:
+                self.writer.add_scalar('eval/refcoco_acc', acc, step)
+
+            no_seg_frac = None
+            if local_total_texts > 0:
+                no_seg_frac = float(local_no_seg) / float(local_total_texts)
+                self.writer.add_scalar('eval/refcoco_no_seg_frac', no_seg_frac, step)
+
+            eval_log = {
+                'step': int(step),
+                'split': self.args.eval_split,
+                'acc': acc,
+                'metric': metric,
+                'no_seg': int(local_no_seg),
+                'total_texts': int(local_total_texts),
+                'no_seg_frac': no_seg_frac,
+                'time_sec': round(time.time() - start_time, 2),
+            }
+            with open(self.output_dir / 'eval.log', 'a', encoding='utf-8') as f:
+                f.write(json.dumps(eval_log, ensure_ascii=True) + '\n')
+
+            if self.args.eval_stop_threshold is not None and acc is not None:
+                stop_flag = 1 if acc < float(self.args.eval_stop_threshold) else 0
+            else:
+                stop_flag = 0
+        else:
+            stop_flag = 0
+
+        if dist.is_available() and dist.is_initialized():
+            flag = torch.tensor(stop_flag, device=self.device, dtype=torch.int)
+            dist.broadcast(flag, src=0)
+            stop_flag = int(flag.item())
+            barrier()
+
+        if stop_flag:
+            if rank == 0:
+                print(f"[EVAL] Acc below threshold; stopping at step {step}.")
+            self.reached_max_steps = True
+
+        if old_max_new is not None and hasattr(model, 'gen_config'):
+            model.gen_config.max_new_tokens = old_max_new
+
+        model.train()
+        return metric
+
+    def _build_variant_state(self, current_state: dict, variant: str) -> dict:
+        def _is_lora(name: str) -> bool:
+            return 'lora' in name.lower()
+
+        def _is_sam2_or_text(name: str) -> bool:
+            return name.startswith('grounding_encoder.') or name.startswith('text_hidden_fcs.')
+
+        def _is_proj(name: str) -> bool:
+            return 'mlp1' in name
+
+        if variant == 'full':
+            return current_state
+
+        next_state = dict(self._base_trainable_state)
+        for name, tensor in current_state.items():
+            keep = False
+            if variant == 'lora_only':
+                keep = _is_lora(name)
+            elif variant == 'sam2_text':
+                keep = _is_sam2_or_text(name)
+            elif variant == 'lora_sam2_text':
+                keep = _is_lora(name) or _is_sam2_or_text(name)
+            elif variant == 'proj_only':
+                keep = _is_proj(name)
+            if keep:
+                next_state[name] = tensor
+        return next_state
+
+    def _run_variant_evals(self, step: int):
+        if not self.args.refcoco_dir:
+            return
+        variants = ['full', 'lora_only', 'sam2_text', 'lora_sam2_text', 'proj_only']
+        current_state = {
+            n: p.detach().cpu().clone() for n, p in self.actual_model.named_parameters() if p.requires_grad
+        }
+        for variant in variants:
+            state = self._build_variant_state(current_state, variant)
+            self.actual_model.load_state_dict(state, strict=False)
+            metric = self._run_refcoco_eval(step)
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if self.writer is not None and metric is not None and hasattr(metric, 'get'):
+                acc = metric.get('Acc', None)
+                if acc is not None:
+                    self.writer.add_scalar(f'eval_variant/{variant}_acc', float(acc), step)
+            print(f"[EVAL] {variant} done at step {step}.")
+        self.actual_model.load_state_dict(current_state, strict=False)
 
     def pseudo_gumbel_step(
         self,
@@ -1089,8 +1498,8 @@ class PseudoGumbelTrainerV2:
         cap_ids = torch.tensor(cap_ids, device=self.device, dtype=torch.long)
         cap_embeds = self.embedding_layer(cap_ids)  # (B,T,D)
 
-        # Step A: predict mask' (no supervision here; only used to condition Step B)
-        pred_masks = predict_masks_with_text_embeds(
+        # Step A: predict mask' (add LM loss on the segmentation answer to preserve `[SEG]` generation)
+        pred_masks, seg_llm_loss = predict_masks_with_text_embeds(
             model=self.actual_model,
             pixel_values=pixel_values,
             g_pixel_values=g_pixel_values,
@@ -1098,6 +1507,7 @@ class PseudoGumbelTrainerV2:
             seg_token_id=self.seg_token_id,
             tokenizer=self.tokenizer,
             device=self.device,
+            return_llm_loss=True,
         )
 
         # Convert mask' -> prompt_masks grid for Step B conditioning.
@@ -1110,17 +1520,31 @@ class PseudoGumbelTrainerV2:
             pooled = F.adaptive_avg_pool2d(m, (16, 16))  # (B,1,16,16)
             prompt_masks_pred = (pooled > 0.5).to(torch.uint8).squeeze(1)  # (B,16,16)
 
-        # Step B: mask' + image -> caption' (teacher forcing CE against caption)
-        cap_loss = compute_dam_caption_ce_loss(
-            model=self.actual_model,
-            pixel_values=pixel_values,
-            prompt_masks=prompt_masks_pred,
-            captions=captions,
-            tokenizer=self.tokenizer,
-            max_caption_len=cap_len,
-            device=self.device,
-        )
-        return {"loss": cap_loss, "dam_caption_ce": float(cap_loss.item()), "batch_size": batch_size}
+        # Step B: mask' + image -> caption' (teacher forcing CE against caption).
+        # If mask' is empty for a sample, skip it to avoid training on invalid prompts.
+        valid_mask = (prompt_masks_pred.sum(dim=(1, 2)) > 0)
+        cap_loss = torch.tensor(0.0, device=self.device)
+        if bool(valid_mask.any().item()):
+            valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+            if isinstance(valid_idx, int):
+                valid_idx = [valid_idx]
+            cap_loss = compute_dam_caption_ce_loss(
+                model=self.actual_model,
+                pixel_values=pixel_values[valid_mask],
+                prompt_masks=prompt_masks_pred[valid_mask],
+                captions=[captions[i] for i in valid_idx],
+                tokenizer=self.tokenizer,
+                max_caption_len=cap_len,
+                device=self.device,
+            )
+        total_loss = cap_loss + (self.dam_seg_llm_loss_weight * seg_llm_loss)
+        return {
+            "loss": total_loss,
+            "dam_caption_ce": float(cap_loss.item()),
+            "dam_seg_llm_loss": float(seg_llm_loss.item()) if torch.is_tensor(seg_llm_loss) else float(seg_llm_loss),
+            "dam_valid_masks": int(valid_mask.sum().item()),
+            "batch_size": batch_size,
+        }
 
     def _dual_loop_backward_accumulate(self, loss1, loss2, *, beta: float, grad_accum_steps: int):
         """
@@ -1148,6 +1572,12 @@ class PseudoGumbelTrainerV2:
         dot = torch.tensor(0.0, device=self.device, dtype=torch.float32)
         g1_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
         g2_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g1_lora_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g2_lora_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g1_proj_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g2_proj_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g1_sam2_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        g2_sam2_norm2 = torch.tensor(0.0, device=self.device, dtype=torch.float32)
         for i, p in enumerate(self._trainable_params):
             g1 = g1_list[i]
             g2 = p.grad
@@ -1158,11 +1588,27 @@ class PseudoGumbelTrainerV2:
             dot = dot + (g1_f * g2_f).sum()
             g1_norm2 = g1_norm2 + (g1_f * g1_f).sum()
             g2_norm2 = g2_norm2 + (g2_f * g2_f).sum()
+            name = self._trainable_param_names[i].lower()
+            if "lora" in name:
+                g1_lora_norm2 = g1_lora_norm2 + (g1_f * g1_f).sum()
+                g2_lora_norm2 = g2_lora_norm2 + (g2_f * g2_f).sum()
+            elif "sam_mask_decoder" in name or "sam2" in name:
+                g1_sam2_norm2 = g1_sam2_norm2 + (g1_f * g1_f).sum()
+                g2_sam2_norm2 = g2_sam2_norm2 + (g2_f * g2_f).sum()
+            elif "mlp1" in name or "text_hidden_fcs" in name:
+                g1_proj_norm2 = g1_proj_norm2 + (g1_f * g1_f).sum()
+                g2_proj_norm2 = g2_proj_norm2 + (g2_f * g2_f).sum()
 
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(dot, op=dist.ReduceOp.SUM)
             dist.all_reduce(g1_norm2, op=dist.ReduceOp.SUM)
             dist.all_reduce(g2_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g1_lora_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g2_lora_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g1_proj_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g2_proj_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g1_sam2_norm2, op=dist.ReduceOp.SUM)
+            dist.all_reduce(g2_sam2_norm2, op=dist.ReduceOp.SUM)
 
         if float(g1_norm2.item()) > 0:
             coeff = dot / g1_norm2
@@ -1178,6 +1624,22 @@ class PseudoGumbelTrainerV2:
                 self.writer.add_scalar('grad_surgery/g2_norm', float(g2_norm2.sqrt().item()), self.global_step)
                 self.writer.add_scalar('grad_surgery/cos_g1_g2', float(cos), self.global_step)
                 self.writer.add_scalar('grad_surgery/coeff', float(coeff.item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/g1_lora_norm', float(g1_lora_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/g2_lora_norm', float(g2_lora_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar(
+                    'grad_surgery/g2_over_g1_lora',
+                    float((g2_lora_norm2.sqrt() / (g1_lora_norm2.sqrt() + 1e-12)).item()),
+                    self.global_step,
+                )
+                self.writer.add_scalar('grad_surgery/g1_proj_norm', float(g1_proj_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/g2_proj_norm', float(g2_proj_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar(
+                    'grad_surgery/g2_over_g1_proj',
+                    float((g2_proj_norm2.sqrt() / (g1_proj_norm2.sqrt() + 1e-12)).item()),
+                    self.global_step,
+                )
+                self.writer.add_scalar('grad_surgery/g1_sam2_norm', float(g1_sam2_norm2.sqrt().item()), self.global_step)
+                self.writer.add_scalar('grad_surgery/g2_sam2_norm', float(g2_sam2_norm2.sqrt().item()), self.global_step)
 
         for i, p in enumerate(self._trainable_params):
             g1 = g1_list[i]
@@ -1379,6 +1841,14 @@ class PseudoGumbelTrainerV2:
 
         # Default: adapter-centric checkpoint.
         model_state = model_obj.state_dict()
+        # Avoid overriding base embed/lm_head during eval load.
+        drop_keys = {
+            'mllm.model.language_model.base_model.model.model.embed_tokens.weight',
+            'mllm.model.language_model.base_model.model.lm_head.weight',
+        }
+        for k in drop_keys:
+            if k in model_state:
+                del model_state[k]
 
         cpu_state = {k: v.detach().cpu() for k, v in model_state.items()}
         torch.save(cpu_state, path)
