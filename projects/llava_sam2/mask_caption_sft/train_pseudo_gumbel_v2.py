@@ -1521,22 +1521,17 @@ class PseudoGumbelTrainerV2:
             prompt_masks_pred = (pooled > 0.5).to(torch.uint8).squeeze(1)  # (B,16,16)
 
         # Step B: mask' + image -> caption' (teacher forcing CE against caption).
-        # If mask' is empty for a sample, skip it to avoid training on invalid prompts.
+        # NOTE: we do NOT skip empty masks; we still run CE to keep the captioning path trained.
         valid_mask = (prompt_masks_pred.sum(dim=(1, 2)) > 0)
-        cap_loss = torch.tensor(0.0, device=self.device)
-        if bool(valid_mask.any().item()):
-            valid_idx = valid_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
-            if isinstance(valid_idx, int):
-                valid_idx = [valid_idx]
-            cap_loss = compute_dam_caption_ce_loss(
-                model=self.actual_model,
-                pixel_values=pixel_values[valid_mask],
-                prompt_masks=prompt_masks_pred[valid_mask],
-                captions=[captions[i] for i in valid_idx],
-                tokenizer=self.tokenizer,
-                max_caption_len=cap_len,
-                device=self.device,
-            )
+        cap_loss = compute_dam_caption_ce_loss(
+            model=self.actual_model,
+            pixel_values=pixel_values,
+            prompt_masks=prompt_masks_pred,
+            captions=captions,
+            tokenizer=self.tokenizer,
+            max_caption_len=cap_len,
+            device=self.device,
+        )
         total_loss = cap_loss + (self.dam_seg_llm_loss_weight * seg_llm_loss)
         return {
             "loss": total_loss,
